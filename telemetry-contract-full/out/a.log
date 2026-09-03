@@ -1,0 +1,92 @@
+
+==============================================================================
+A0. Are the three personas' metric names even legal in one system?
+==============================================================================
+
+  owner                          metric name                                     legal?
+  --------------------------------------------------------------------------------------
+  MODEL  (vLLM, shipped)         vllm:time_to_first_token_seconds               ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:time_per_output_token_seconds             ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_queue_time_seconds                ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_prefill_time_seconds              ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_decode_time_seconds               ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:kv_cache_usage_perc                       ILLEGAL
+  MODEL  (SGLang, shipped)       sglang:time_to_first_token_seconds             ILLEGAL
+  MODEL  (OTel GenAI semconv)    gen_ai.server.time_to_first_token                   OK
+  MODEL  (OTel GenAI semconv)    gen_ai.server.time_per_output_token                 OK
+  CLIENT (OTel GenAI semconv)    gen_ai.client.operation.time_to_first_chunk         OK
+  TRANSPORT (gRFC A66)           grpc.client.attempt.duration                        OK
+  TRANSPORT (gRFC A66)           grpc.server.call.duration                           OK
+  TRANSPORT (gRFC A80)           grpc.tcp.sender_latency                             OK
+  TRANSPORT (proposed)           grpc.client.attempt.time_to_first_message           OK
+  --------------------------------------------------------------------------------------
+  7 of 14 names cannot be registered as an OTel instrument.
+  Every one of them is a MODEL-SERVER name, and the reason is one character:
+  ':' is Prometheus namespacing and is not in the OTel instrument charset.
+
+  opentelemetry-sdk raised: Exception: Expected ASCII string of maximum length 63 characters but got vllm:time_to_first_token_seconds
+  NB the message says 'maximum length 63 characters'. The name is 32
+  characters long. The installed regex is r"[a-zA-Z][-_./a-zA-Z0-9]{0,254}"
+  -- correct per spec (255), but the diagnostic points at the wrong thing.
+
+==============================================================================
+A1. Three real observers, same 8 RPCs (4 prefill-heavy, 4 decode-heavy)
+==============================================================================
+  8 RPCs complete.
+
+  MODEL observer  (GenAI semconv server + vLLM): 6 instrument(s)
+    gen_ai.server.request.duration                       attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    gen_ai.server.time_per_output_token                  attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    gen_ai.server.time_to_first_token                    attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_decode_time_seconds                     attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_prefill_time_seconds                    attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_queue_time_seconds                      attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+
+  TRANSPORT observer (gRPC's OWN A66 plugin): 8 instrument(s)
+    grpc.client.attempt.duration                         attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.rcvd_total_compressed_message_size attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.sent_total_compressed_message_size attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.started                          attrs=['grpc.method', 'grpc.target']
+    grpc.server.call.duration                            attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.rcvd_total_compressed_message_size  attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.sent_total_compressed_message_size  attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.started                             attrs=['grpc.method']
+
+  CLIENT observer (the two PROPOSED histograms): 2 instrument(s)
+    grpc.client.attempt.inter_message_gap                attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.time_to_first_message            attrs=['grpc.method', 'grpc.status', 'grpc.target']
+
+==============================================================================
+A2. Phase x persona matrix, scored from the instruments above
+==============================================================================
+
+  phase                      ML ENG  SRE today  SRE w/ ask   PRODUCT
+  ------------------------------------------------------------------
+  1 admit / tokenize           FULL       NONE        NONE      NONE
+  2 queue                      FULL       NONE        NONE      NONE
+  3 prefill                    FULL       NONE        NONE      NONE
+  4 KV handoff (disagg)        NONE       NONE        PART      NONE
+  5 first token                FULL       NONE        FULL      NONE
+  6 inter-token gaps           FULL       NONE        FULL      NONE
+  7 detokenize + chunk         NONE       NONE        PART      NONE
+  8 wire / transport           NONE       PART        PART      NONE
+  9 whole call                 FULL       FULL        FULL      FULL
+  ------------------------------------------------------------------
+  FULL rows:  ML 6/9   SRE today 1/9   SRE with ask 3/9   PM 1/9
+  ML n SRE shared rows -- today: 1   with the ask: 3
+
+==============================================================================
+A3. THE JOIN QUESTION -- can these go on one dashboard panel?
+==============================================================================
+
+  MODEL     attribute keys (3): ['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+  TRANSPORT attribute keys (3): ['grpc.method', 'grpc.status', 'grpc.target']
+  CLIENT    attribute keys (3): ['grpc.method', 'grpc.status', 'grpc.target']
+  MODEL n TRANSPORT = EMPTY SET
+  MODEL n CLIENT = EMPTY SET
+  TRANSPORT n CLIENT = ['grpc.method', 'grpc.status', 'grpc.target']
+
+  -> No attribute in common between the model server's metrics and the
+     transport's. Not different names for the same dimension -- no shared
+     dimension at all. Nothing to group_by jointly, nothing to filter both
+     by. The handoff has no join key, so it happens in a meeting.

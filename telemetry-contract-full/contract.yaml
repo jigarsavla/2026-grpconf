@@ -1,0 +1,33 @@
+# A TELEMETRY API CONTRACT.
+# What a latency dashboard/SLO actually depends on, written down, so it can be
+# tested in CI the way any other API dependency is.
+name: inference-latency-slo
+consumers: [platform-sre, ml-engineer, product]
+depends_on:
+  - instrument: grpc.server.call.duration
+    emitted_by: grpc-observability
+    required_attributes: [grpc.method, grpc.status]
+    needs_stability: stable
+  - instrument: grpc.client.attempt.duration
+    emitted_by: grpc-observability
+    required_attributes: [grpc.method, grpc.target, grpc.status]
+    needs_stability: stable
+  - instrument: grpc.client.call.duration       # grpc.io lists this "stable, on by default"
+    emitted_by: grpc-observability
+    required_attributes: [grpc.method, grpc.target, grpc.status]
+    needs_stability: stable
+  - instrument: gen_ai.server.time_to_first_token
+    emitted_by: model-server
+    required_attributes: [gen_ai.operation.name, gen_ai.provider.name]
+    needs_stability: stable
+    needs_bucket_advice: true
+  - instrument: gen_ai.server.time_per_output_token
+    emitted_by: model-server
+    required_attributes: [gen_ai.operation.name, gen_ai.provider.name]
+    needs_stability: stable
+    needs_bucket_advice: true
+joins:
+  # the SLO wants to say "when TTFT regresses, is it this method or this model?"
+  - name: model-side to transport-side
+    left:  gen_ai.server.time_to_first_token
+    right: grpc.server.call.duration

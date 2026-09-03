@@ -1,0 +1,62 @@
+
+==============================================================================
+B1. THE LATENCY POLICY IS BIASED AGAINST SLOW REQUESTS
+==============================================================================
+  decision_wait = 2.0s;  policy: latency, threshold_ms = 1000
+  README: 'The duration is determined by looking at the earliest start
+  time and latest end time' -- of the spans the processor HOLDS.
+  num_traces = 50,000, no eviction: README Scenario 1.
+
+   stream    true dur   dur/dw   spans held    dur AS SEEN     policy
+   (tokens)   (p50 ms)           at decision   by sampler      kept
+   ----------------------------------------------------------------------
+       400      759.3    0.38       5 of 5        759.4 ms    0/6
+       700     1286.5    0.64       5 of 5       1286.6 ms    6/6
+      1100     1983.9    0.99       5 of 5       1983.9 ms    6/6
+      1800     3213.6    1.61       2 of 5         51.1 ms    0/6
+      3600     6305.6    3.15       2 of 5         51.2 ms    0/6
+      7200    12534.0    6.27       2 of 5         51.1 ms    0/6
+
+   EVERY arm is slower than the 1000 ms the policy was written to catch.
+   Kept 6/6 up to 1984 ms.
+   Kept 0/6 from  759 ms upward.
+   The 5-span trace is judged on 2 spans that finished early;
+   the sampler sees ~51 ms where the truth is 12534 ms (245x).
+
+==============================================================================
+B2. SCENARIO 2 -- THE BUFFER TURNS OVER BEFORE THE STREAM ENDS
+==============================================================================
+  Same traffic; the trace's bucket is released 1.0 s after its decision,
+  which is what production traffic does to a 50,000-entry ring buffer.
+  README: 'it is as if this component has never seen the trace before:
+  The late spans are buffered for decision_wait seconds and then a new
+  sampling decision is made.'
+
+   stream    kept   complete   decisions   spans kept   which spans survived
+   ----------------------------------------------------------------------------
+      1800   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+      3600   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+      7200   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+
+   The trace comes back -- as a fragment. The spans that survive are the
+   LONG ones. 'schedule' and 'prefill' were decided on and dropped before
+   the stream finished, so the kept fragment is the half of the trace that
+   does NOT contain time-to-first-token.
+
+==============================================================================
+B3. CONFIGURING THE DECISION CACHE MAKES IT WORSE
+==============================================================================
+  sampled_cache_size and non_sampled_cache_size both default to 0
+  (inactive). Configuring them is the standard operational advice.
+  Arm: 3600 tokens (~6.4 s), eviction 1.0 s after decision.
+
+   configuration                      kept   spans kept   from cache
+   ------------------------------------------------------------------
+   no cache (the default)             6/6    3 of 5           0
+   sampled_cache_size = 100000        6/6    3 of 5           0
+   both caches = 100000               0/6    0 of 5          18
+
+   The non-sampled cache does exactly what it is documented to do: it
+   remembers the drop. The drop was decided on 57 ms of a 6-second
+   stream. The cache turns a partial recovery into a total loss --
+   consistently, which is the point of a cache, and wrongly.

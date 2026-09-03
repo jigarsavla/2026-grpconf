@@ -1,0 +1,59 @@
+
+==============================================================================
+C1-C4. Contract assertions against the REAL libraries
+==============================================================================
+
+  grpc.server.call.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['grpc.method', 'grpc.status']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  grpc.client.attempt.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['grpc.method', 'grpc.status', 'grpc.target']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  grpc.client.call.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [FAIL]   <- never appears in the export
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  gen_ai.server.time_to_first_token   (emitted_by: model-server)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['gen_ai.operation.name', 'gen_ai.provider.name']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+    C4 SDK helper carries bucket advice       [FAIL]
+       helper source:
+         name=GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+         description="Time to generate first token for successful responses.",
+         unit="s",
+         )
+       -> exported with 15 bucket boundaries (SDK default is 15)
+
+  gen_ai.server.time_per_output_token   (emitted_by: model-server)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['gen_ai.operation.name', 'gen_ai.provider.name']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+    C4 SDK helper carries bucket advice       [FAIL]
+       helper source:
+         name=GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN,
+         description="Time per output token generated after the first token for successful responses.",
+         unit="s",
+         )
+       -> exported with 15 bucket boundaries (SDK default is 15)
+
+==============================================================================
+C5. Is the join the SLO assumes actually possible?
+==============================================================================
+
+  join 'model-side to transport-side'                          [FAIL]
+    gen_ai.server.time_to_first_token      ['gen_ai.operation.name', 'gen_ai.provider.name']
+    grpc.server.call.duration              ['grpc.method', 'grpc.status']
+    shared dimensions: NONE
+
+==============================================================================
+CONTRACT RESULT
+==============================================================================
+  8/17 assertions pass, 9 FAIL.
+  Every failure is a real property of released software, not of this rig.
+  A dashboard is a consumer of a telemetry API. Nobody writes down the
+  contract, so nobody notices when it is not met.
