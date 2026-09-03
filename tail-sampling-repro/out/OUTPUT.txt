@@ -1,0 +1,280 @@
+an earlier lab lab -- sampling, exemplars, and the long stream
+python Python 3.11.15  grpcio 1.83.1
+opentelemetry-sdk 1.44.0
+Sat Aug 29 14:26:29 UTC 2026
+
+==============================================================================
+A1. THE INVISIBLE INTERVAL -- one real decode-heavy inference RPC
+==============================================================================
+  call: ttfm 71.7 ms  gap p50 14.04 ms  duration 1150.7 ms  messages 78
+
+  span            started(ms)   ended(ms)   lifetime   INVISIBLE FOR
+  --------------------------------------------------------------------
+  Sent.tailsampling.Inference/Generate      0.3     1151.1     1150.8     1150.8 ms
+  Recv.tailsampling.Inference/Generate      2.9     1150.4     1147.5     1147.5 ms
+  schedule                        2.9        3.8        0.9        0.9 ms
+  prefill                         3.9       54.1       50.2       50.2 ms
+  decode                         54.3     1150.3     1096.0     1096.0 ms
+
+  first span to become visible : 'schedule' at t=3.8 ms
+  root span becomes visible    : t=1151.1 ms
+  -> the spans of ONE trace arrive at a collector spread over 1147.3 ms,
+     and the root -- the only span that knows the call's duration --
+     arrives LAST, 1147.3 ms after the first.
+
+==============================================================================
+A2. ARRIVAL SPREAD SCALES WITH THE STREAM (decode-heavy, max_tokens swept)
+==============================================================================
+  max_tok   duration    root invisible for    span arrival spread
+  ----------------------------------------------------------------
+       64     165.7 ms            165.7 ms              163.5 ms
+      256     503.8 ms            503.8 ms              501.6 ms
+      624    1145.4 ms           1145.4 ms             1143.2 ms
+     1600    2854.8 ms           2854.8 ms             2852.7 ms
+     3200    5645.8 ms           5645.8 ms             5643.7 ms
+
+  The root span's invisible interval IS the call duration, by
+  construction. A 60-second generation is a 60-second blind spot.
+
+==============================================================================
+A3. THE POINTER IS EXPORTED BEFORE THE THING IT POINTS AT
+==============================================================================
+  one decode-heavy RPC, one injected 400 ms stall at token 200
+  call duration        : 1543.4 ms
+  root span visible at : t=1543.5 ms
+  trace id             : eed8bc0441686c477d2d32e51e31bfdc
+
+  metric exports during and after the call (250 ms interval):
+    t(ms)   metric                      exemplars  max exemplar  trace_id(hex, 8)
+    ------------------------------------------------------------------------------
+      249.3  tailsampling.inter_message_gap            1      13.86 ms  eed8bc04
+      499.8  tailsampling.inter_message_gap            1      13.89 ms  eed8bc04
+     1000.5  tailsampling.inter_message_gap            2     414.11 ms  eed8bc04
+     1250.8  tailsampling.inter_message_gap            1      13.83 ms  eed8bc04
+     1501.1  tailsampling.inter_message_gap            1      14.30 ms  eed8bc04
+     1751.6  tailsampling.inter_message_gap            1      14.02 ms  eed8bc04
+
+  first exemplar carrying a trace id exported at : t=249.3 ms
+  the span it points at became visible at        : t=1543.5 ms
+  -> the pointer was on the wire 1294.2 ms BEFORE the trace existed.
+     A backend resolving that exemplar the moment it lands finds nothing.
+
+  and the one that matters -- the 414 ms stall -- was exported
+  at t=1000.5 ms, 543.1 ms before its trace existed.
+
+==============================================================================
+B1. THE LATENCY POLICY IS BIASED AGAINST SLOW REQUESTS
+==============================================================================
+  decision_wait = 2.0s;  policy: latency, threshold_ms = 1000
+  README: 'The duration is determined by looking at the earliest start
+  time and latest end time' -- of the spans the processor HOLDS.
+  num_traces = 50,000, no eviction: README Scenario 1.
+
+   stream    true dur   dur/dw   spans held    dur AS SEEN     policy
+   (tokens)   (p50 ms)           at decision   by sampler      kept
+   ----------------------------------------------------------------------
+       400      758.1    0.38       5 of 5        758.2 ms    0/6
+       700     1277.0    0.64       5 of 5       1277.0 ms    6/6
+      1100     1992.6    1.00       5 of 5       1992.8 ms    6/6
+      1800     3217.1    1.61       2 of 5         51.2 ms    0/6
+      3600     6431.1    3.22       2 of 5         51.2 ms    0/6
+      7200    12662.1    6.33       2 of 5         51.1 ms    0/6
+
+   EVERY arm is slower than the 1000 ms the policy was written to catch.
+   Kept 6/6 at 1277 ms and 1993 ms.
+   Kept 0/6 at 3217 ms and every duration above it,
+   including 12662 ms.
+   The detection rate is NOT monotone in latency. It inverts at
+   duration = decision_wait, which no policy field mentions.
+   At the top arm the sampler judges a 5-span trace on 2 spans and
+   sees 51 ms where the truth is 12662 ms -- 248x understated.
+
+==============================================================================
+B2. SCENARIO 2 -- THE BUFFER TURNS OVER BEFORE THE STREAM ENDS
+==============================================================================
+  Same traffic; the trace's bucket is released 1.0 s after its decision,
+  which is what production traffic does to a 50,000-entry ring buffer.
+  README: 'it is as if this component has never seen the trace before:
+  The late spans are buffered for decision_wait seconds and then a new
+  sampling decision is made.'
+
+   stream    kept   complete   decisions   spans kept   which spans survived
+   ----------------------------------------------------------------------------
+      1800   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+      3600   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+      7200   6/6     0/6     mean 2.0    3 of 5     Recv.Gen,Sent.Gen,decode
+
+   The trace comes back -- as a fragment. The spans that survive are the
+   LONG ones. 'schedule' and 'prefill' were decided on and dropped before
+   the stream finished, so the kept fragment is the half of the trace that
+   does NOT contain time-to-first-token.
+
+==============================================================================
+B3. CONFIGURING THE DECISION CACHE MAKES IT WORSE
+==============================================================================
+  sampled_cache_size and non_sampled_cache_size both default to 0
+  (inactive). Configuring them is the standard operational advice.
+  Arm: 3600 tokens (~6.4 s), eviction 1.0 s after decision.
+
+   configuration                      kept   spans kept   from cache
+   ------------------------------------------------------------------
+   no cache (the default)             6/6    3 of 5           0
+   sampled_cache_size = 100000        6/6    3 of 5           0
+   both caches = 100000               0/6    0 of 5          18
+
+   The non-sampled cache does exactly what it is documented to do: it
+   remembers the drop. The drop was decided on 57 ms of a 6-second
+   stream. The cache turns a partial recovery into a total loss --
+   consistently, which is the point of a cache, and wrongly.
+  (default ExemplarFilter is TraceBased -- OTEL_METRICS_EXEMPLAR_FILTER default is trace_based (unset))
+
+==============================================================================
+C1. EXEMPLAR POINTER RESOLUTION, ACROSS THE PIPELINE
+==============================================================================
+  gap histogram on A66's 41 latency boundaries; tail sampler with a
+  latency policy at 1000 ms and decision_wait 2.0s.
+  'resolved' = the trace id names a trace the tail sampler KEPT.
+
+  configuration                                exemp  no-tid  unres  partial  complete   resolved  you land on
+  --------------------------------------------------------------------------------------------------------------------
+  short stream 1.3s, always_on, no eviction       15       0       0        0        15   100.0%  5/5 (whole)
+  long stream 6.4s, always_on, Scenario 1         33       0      33        0         0     0.0%  -
+  long stream 6.4s, always_on, Scenario 2         36       0       0       36         0   100.0%  3/5 (no prefill,schedule)
+  long stream 6.4s, always_on, Sc.2 + caches      32       0      32        0         0     0.0%  -
+  long stream 6.4s, DEFAULT filter, head 1%        0       0       0        0         0     0.0%  -
+
+  Row 1 is the control: a stream shorter than decision_wait resolves.
+  Row 2 is the same instrumentation on a longer generation.
+  Row 5 is the configuration almost everyone is running today.
+
+==============================================================================
+C2. THE EXEMPLARS THAT MATTER -- gaps over 100 ms
+==============================================================================
+  One call per arm carries an injected 400 ms stall. These are the
+  exemplars the whole mechanism exists to preserve.
+
+  configuration                          tail exemplars   resolving to a kept trace
+  --------------------------------------------------------------------------------
+  short 1.3s, no eviction                       1             1       (worst gap seen: 414 ms)
+  long 6.4s, Scenario 1                         1             0       (worst gap seen: 414 ms)
+  long 6.4s, Scenario 2                         1             1       (worst gap seen: 414 ms)
+  long 6.4s, Sc.2 + caches                      1             0       (worst gap seen: 414 ms)
+  long 6.4s, default filter + head 1%           0             0       (worst gap seen: 0 ms)
+
+  The histogram itself recorded every one of those gaps, in every row.
+  What is lost is not the measurement. It is the ability to ask WHY.
+
+==============================================================================
+C3. THE POINTER IS EXPORTED BEFORE THE TRACE EXISTS
+==============================================================================
+  For the long Scenario-2 arm: exemplar export time vs the moment the
+  trace it names became available downstream (its last kept fragment).
+
+    exemplar value    exported BEFORE the call even ended by
+    ----------------------------------------------------------
+         414.3 ms        3014.1 ms
+
+    plus decision_wait (2s) before the fragment is
+    exported, plus a second decision_wait for the late fragment.
+    At the Collector's 30 s default that is a minute of dangling
+    pointer per exemplar, on top of the generation's own length.
+
+==============================================================================
+D1. IS gRFC A96 IN grpc-python? (merged 1 Jul 2025)
+==============================================================================
+  grpcio 1.83.1 / grpc_observability at /usr/local/lib/python3.11/dist-packages/grpc_observability
+  9 .py files scanned
+
+  A96 instrument                          present in source?
+  --------------------------------------------------------
+  grpc.client.call.retries               NO
+  grpc.client.call.transparent_retries   NO
+  grpc.client.call.hedges                NO
+  grpc.client.call.retry_delay           NO
+    keyword 'retries'              occurrences: 0
+    keyword 'hedges'               occurrences: 0
+    keyword 'retry_delay'          occurrences: 0
+    keyword 'transparent_retries'  occurrences: 0
+
+  instruments actually emitted by gRPC's own OTel plugin: 8
+    grpc.client.attempt.duration
+    grpc.client.attempt.rcvd_total_compressed_message_size
+    grpc.client.attempt.sent_total_compressed_message_size
+    grpc.client.attempt.started
+    grpc.server.call.duration
+    grpc.server.call.rcvd_total_compressed_message_size
+    grpc.server.call.sent_total_compressed_message_size
+    grpc.server.call.started
+
+  of A96's four: 0 emitted.
+
+==============================================================================
+D2. THE ASK IS A96'S SHAPE AT A DIFFERENT OBSERVATION POINT
+==============================================================================
+  gRFC                 | A80 (In Review)                | A96 (merged 2025-07-01)                | this talk's ask                         
+  -----------------------------------------------------------------------------------------------------------------------------------------
+  what it measures     | per-WRITE socket latency       | per-CALL retry counts/delay            | per-MESSAGE first/gap                   
+  observation point    | TCP socket (SO_TIMESTAMPING)   | the client call object                 | transport read boundary                 
+  instrument type      | Histogram                      | Histogram x4                           | Histogram x2                            
+  attribute set        | none / grpc.transfer_size      | grpc.method + grpc.target              | grpc.method + grpc.target + grpc.status 
+  bucket boundaries    | unspecified                    | A66's latency boundaries (retry_delay) | A66's latency boundaries                
+  default state        | off, sampled 1-in-1000         | experimental, off by default           | experimental, off by default            
+  registers via        | A79 GlobalInstrumentsRegistry  | A79 (stated in the gRFC)               | A79 GlobalInstrumentsRegistry           
+
+  A96 added four brand-new call-level histograms to gRPC, with exactly
+  the attribute set the ask proposes, reusing A66's bucket boundaries,
+  experimental and off by default -- and it is merged. The ask is not a
+  new kind of thing. It is the same thing, one level further in.
+
+  Also worth saying out loud: A96 exists because retry counts were
+  unmeasurable from A66 alone. Emitted by grpc-python today: 0/4.
+
+==============================================================================
+D3. THE AFFORDABILITY LEDGER -- real OTLP bytes for the two histograms
+==============================================================================
+  population: 462 real inter-message gaps + 6 real TTFMs
+              gap p50 13.97 ms  p99 14.39 ms max 414.0 ms
+
+   time series   no exemplars   with exemplars   exemplars carried   overhead
+   --------------------------------------------------------------------------
+          1         1,998 B         2,238 B                5        1.12x
+         10        16,994 B        19,394 B               50        1.14x
+        100       167,118 B       191,118 B              500        1.14x
+
+   Both numbers are bounded by BUCKET COUNT x SERIES COUNT, not by
+   observation count: the reservoir for an explicit-bucket histogram
+   is 'always the number of bucket boundaries plus one', and it is
+   reset every collection cycle. 41 boundaries -> at most 42 exemplars
+   per series per interval, however many tokens you serve.
+
+   SCALING ARM -- 1 series, same two histograms, traffic multiplied:
+     traffic      with exemplars   exemplars   vs 1x
+     --------------------------------------------------
+       1x (  462 gaps)      2,238 B          5    1.00x
+       4x ( 1848 gaps)      2,238 B          5    1.00x
+      16x ( 7392 gaps)      2,238 B          5    1.00x
+   16x the observations, ZERO extra bytes -- but be honest about why:
+   replaying the SAME gap population re-fills the SAME buckets, which
+   is the best case. an earlier lab measured 16 DISTINCT RPCs at 1.15x. The
+   defensible claim is 'asymptotically bounded by bucket count',
+   never 'flat'. Compare span events over the same 16x: 15.6x (an earlier lab A2).
+
+==============================================================================
+D4. WHAT THE POINTER STORY COSTS -- tail sampling memory
+==============================================================================
+  one decode-heavy RPC = 5 spans = 850 B of OTLP trace data
+  a tail sampler must HOLD that for decision_wait, per in-flight trace.
+
+   num_traces   bytes held        note
+   --------------------------------------------------------------
+      50,000        42.5 MB     the Collector default
+      10,000         8.5 MB     
+       1,000         0.8 MB     
+
+   And that is the OPTIMISTIC figure: it assumes 5 spans per trace.
+   A per-message child span (an earlier lab costed it at 138.5 B/message) on a
+   624-token generation is 78 more spans per trace.
+
+   Compare with D3: the two histograms cost hundreds of bytes per
+   export interval, flat in traffic. The expensive half of this
+   architecture is the half that does not survive a long stream.

@@ -1,0 +1,105 @@
+
+==============================================================================
+B1. Three honest numbers for 'TTFT' on ONE request
+==============================================================================
+
+  ML engineer  gen_ai.server.time_to_first_token      15.34 ms
+  SRE          time to first MESSAGE (transport)      37.26 ms
+  Product      end to end, user-perceived           1121.45 ms
+
+  offset model->transport: 21.92 ms = 142.9% of the model's number
+  All three are correct. Nothing in any specification says which one an
+  SLO is written against, and no two of them can be joined (see A3).
+
+==============================================================================
+B2. Five real faults x four dashboards -- who sees it?
+==============================================================================
+
+  NB: ml.tpot_p50 is the p50 across requests of each request's MEAN
+      inter-token gap -- the way vLLM defines TPOT. The p50 of each
+      request's MEDIAN gap is tracked alongside it to show the difference.
+
+  baseline: ml.ttft 15.3  ml.tpot 1.762  sre.dur 1115.5  ask.ttfm 39.6  ask.gap_p99 27.95  ask.gap_worst 27.9
+
+  fault                            ML ENGINEER   SRE (today)  SRE (w/ ask)       PRODUCT
+  ------------------------------------------------------------------------------------
+  prefill regression (+40%)               SEES            --            --            --
+  queue saturation (+250ms)               SEES          SEES          SEES          SEES
+  slow consumer (20ms/msg)                SEES          SEES          SEES          SEES
+  KV handoff +150ms (disagg)                --            --          SEES            --
+  one 400ms decode stall                  SEES          SEES          SEES          SEES
+  ------------------------------------------------------------------------------------
+  ML ENGINEER    detects 4/5 faults
+  SRE (today)    detects 3/5 faults
+  SRE (w/ ask)   detects 4/5 faults
+  PRODUCT        detects 3/5 faults
+
+==============================================================================
+B2b. What kind of conversation does each fault produce?
+==============================================================================
+
+  prefill regression (+40%)
+      today:        ONLY ML sees it -> HANDOFF
+      with the ask: ONLY ML -> handoff
+        MOVED ML ENGINEER    ml.ttft_p50              15.32 ->     20.44 ms     +33.4%
+          -   SRE (today)    sre.call_dur_p99       1120.10 ->   1140.91 ms      +1.9%
+          -   SRE (w/ ask)   ask.ttfm_p50             39.59 ->     46.32 ms     +17.0%
+          -   PRODUCT        pm.e2e_p50             1115.51 ->   1116.42 ms      +0.1%
+
+  queue saturation (+250ms)
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.ttft_p50              15.32 ->    265.34 ms   +1631.5%
+        MOVED SRE (today)    sre.call_dur_p99       1120.10 ->   1412.36 ms     +26.1%
+        MOVED SRE (w/ ask)   ask.ttfm_p50             39.59 ->    289.32 ms    +630.8%
+        MOVED PRODUCT        pm.e2e_p50             1115.51 ->   1360.72 ms     +22.0%
+
+  slow consumer (20ms/msg)
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.tpot_p50               1.76 ->      3.44 ms     +95.4%
+        MOVED SRE (today)    sre.call_dur_p99       1120.10 ->   2256.33 ms    +101.4%
+        MOVED SRE (w/ ask)   ask.gap_p50              14.06 ->     27.93 ms     +98.6%
+        MOVED PRODUCT        pm.e2e_p50             1115.51 ->   2250.44 ms    +101.7%
+
+  KV handoff +150ms (disagg)
+      today:        NEITHER sees it -> INVISIBLE
+      with the ask: ONLY SRE -> handoff
+          -   ML ENGINEER    ml.ttft_p50              15.32 ->     15.32 ms      -0.0%
+          -   SRE (today)    sre.call_dur_p99       1120.10 ->   1282.33 ms     +14.5%
+        MOVED SRE (w/ ask)   ask.gap_worst            27.94 ->    151.47 ms    +442.1%
+          -   PRODUCT        pm.e2e_p50             1115.51 ->   1264.32 ms     +13.3%
+
+  one 400ms decode stall
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.tpot_p50               1.76 ->      2.39 ms     +35.7%
+        MOVED SRE (today)    sre.call_dur_p99       1120.10 ->   1552.63 ms     +38.6%
+        MOVED SRE (w/ ask)   ask.gap_worst            27.94 ->    417.09 ms   +1392.6%
+        MOVED PRODUCT        pm.e2e_p50             1115.51 ->   1507.77 ms     +35.2%
+
+==============================================================================
+B2c. The SAME fault on the OTHER workload -- who sees it now?
+==============================================================================
+
+  prefill regression (+40%), prefill-heavy workload (4000-token prompt):
+    ml.prefill_p50          800.01 ->   1120.01 ms    +40.0%
+    ml.ttft_p50             802.52 ->   1122.52 ms    +39.9%
+    sre.call_dur_p50       1025.45 ->   1346.51 ms    +31.3%
+    ask.ttfm_p50            826.28 ->   1146.45 ms    +38.7%
+    pm.e2e_p50             1025.45 ->   1346.51 ms    +31.3%
+
+  Same fault, same code, same 40%. On decode-heavy it was 5 ms and only
+  the ML engineer's dashboard moved (because their denominator is 13 ms).
+  On prefill-heavy every dashboard moves. WHO SEES A FAULT IS A PROPERTY
+  OF THE WORKLOAD MIX, not of the instrumentation -- which is why a
+  percentage-based SLO means something different to each persona.
+
+==============================================================================
+B3. Score
+==============================================================================
+  ML vs SRE (today) :  both 3   exactly one 1   neither 1
+  ML vs SRE (w/ ask):  both 3   exactly one 2   neither 0
+
+  'Exactly one' is the count of incidents that must be resolved by a human
+  walking to another team, because the two dashboards cannot be joined.

@@ -1,0 +1,42 @@
+syntax = "proto3";
+package contract;
+
+message GenerateRequest {
+  string workload   = 1;   // "prefill_heavy" | "decode_heavy"
+  int32  prompt_tokens = 2;
+  int32  output_tokens = 3;
+  int32  kv_transfer_ms = 4;   // simulated disaggregated handoff before first token
+  int32  queue_ms       = 5;   // simulated admission queue
+  double prefill_scale  = 6;   // fault injection multiplier
+  double decode_scale   = 7;   // fault injection multiplier
+  int32  stall_after    = 8;   // inject one decode stall after N tokens (0 = none)
+  int32  stall_ms       = 9;
+  string model          = 10;
+}
+
+message Chunk {
+  int32  seq            = 1;
+  int32  tokens         = 2;
+  string text           = 3;
+}
+
+message Ledger {                 // server ground truth, returned out-of-band for the lab
+  double admit_ms   = 1;
+  double queue_ms   = 2;
+  double prefill_ms = 3;
+  double kv_ms      = 4;
+  double first_token_ms = 5;
+  double decode_ms  = 6;
+  double detok_ms   = 7;
+  int32  out_tokens = 8;
+  double ttft_ms    = 9;         // server-defined: arrival -> token 0 produced
+  double tpot_ms    = 10;        // MEAN gap between successive tokens (vLLM-style)
+  double tpot_median_ms = 11;    // median gap, for comparison
+}
+
+message LedgerRequest { string request_id = 1; }
+
+service Inference {
+  rpc Generate(GenerateRequest) returns (stream Chunk);
+  rpc GetLedger(LedgerRequest) returns (Ledger);
+}

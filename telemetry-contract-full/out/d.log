@@ -1,0 +1,90 @@
+
+==============================================================================
+D1. Stability census of the installed semantic-convention package
+==============================================================================
+
+  opentelemetry-semantic-conventions 0.65b0
+
+  METRICS
+    STABLE      ( 2): ['db_metrics', 'http_metrics']
+    DEVELOPMENT (21): azure_metrics, cicd_metrics, container_metrics, cpu_metrics, cpython_metrics, db_metrics, dns_metrics, faas_metrics, gen_ai_metrics, http_metrics, hw_metrics, k8s_metrics, mcp_metrics, messaging_metrics, nfs_metrics, openshift_metrics, otel_metrics, process_metrics, rpc_metrics, system_metrics, vcs_metrics
+    -> gen_ai.*   is DEVELOPMENT
+    -> rpc.*      is DEVELOPMENT
+
+  ATTRIBUTES
+    STABLE      (16): ['client_attributes', 'code_attributes', 'container_attributes', 'db_attributes', 'deployment_attributes', 'error_attributes', 'exception_attributes', 'http_attributes', 'k8s_attributes', 'network_attributes', 'otel_attributes', 'server_attributes', 'service_attributes', 'telemetry_attributes', 'url_attributes', 'user_agent_attributes']
+    DEVELOPMENT (81): app_attributes, artifact_attributes, aws_attributes, az_attributes, azure_attributes, browser_attributes, cassandra_attributes, cicd_attributes, client_attributes, cloud_attributes, cloudevents_attributes, cloudfoundry_attributes, code_attributes, container_attributes, cpu_attributes, cpython_attributes, db_attributes, deployment_attributes, destination_attributes, device_attributes, disk_attributes, dns_attributes, elasticsearch_attributes, enduser_attributes, error_attributes, event_attributes, exception_attributes, faas_attributes, feature_flag_attributes, file_attributes, gcp_attributes, gen_ai_attributes, geo_attributes, graphql_attributes, heroku_attributes, host_attributes, http_attributes, hw_attributes, jsonrpc_attributes, k8s_attributes, linux_attributes, log_attributes, mainframe_attributes, mcp_attributes, message_attributes, messaging_attributes, net_attributes, network_attributes, nfs_attributes, oci_attributes, onc_rpc_attributes, openai_attributes, openshift_attributes, opentracing_attributes, oracle_attributes, oracle_cloud_attributes, os_attributes, otel_attributes, other_attributes, peer_attributes, pool_attributes, pprof_attributes, process_attributes, profile_attributes, rpc_attributes, security_rule_attributes, server_attributes, service_attributes, session_attributes, source_attributes, system_attributes, telemetry_attributes, test_attributes, thread_attributes, tls_attributes, url_attributes, user_agent_attributes, user_attributes, vcs_attributes, webengine_attributes, zos_attributes
+    -> gen_ai.*   is DEVELOPMENT
+    -> rpc.*      is DEVELOPMENT
+
+  Both personas' latency conventions ship in _incubating. The OTel
+  versioning spec on Development signals: "Long-term dependencies
+  SHOULD NOT be taken against signals in Development." An SLO is a
+  long-term dependency. Everyone has one anyway.
+
+==============================================================================
+D2. Two authorities, two answers, for the SAME metric name
+==============================================================================
+
+  grpc.server.call.duration
+    gRFC A66            : defined here, and A66 states it OVERRIDES OTel's
+                          general RPC conventions for gRPC
+    grpc.io docs        : listed under "Server (stable, on by default)"
+    OTel semconv package: ships rpc_metrics under _incubating/  -> DEVELOPMENT
+    OTLP on the wire    : carries no stability field at all (see D3)
+
+  gen_ai.server.time_to_first_token
+    semconv-genai docs  : Development
+    OTel semconv package: _incubating/  -> DEVELOPMENT
+    consistent -- and consistently unusable as an SLO by the spec's own rule.
+
+  A consumer holding a dashboard has no programmatic way to ask "may I depend
+  on this name?" The answer lives in three documents and none of them travels
+  with the data.
+
+==============================================================================
+D3. schema_url -- the migration mechanism's precondition
+==============================================================================
+
+  The package knows about 21 schema versions; newest:
+    https://opentelemetry.io/schemas/1.43.0
+
+  scope                      schema_url                                     metrics
+  ----------------------------------------------------------------------------------
+  grpc-python                (none)                                         8
+  app-no-schema              (none)                                         1
+  app-with-schema            https://opentelemetry.io/schemas/1.43.0        1
+  ----------------------------------------------------------------------------------
+  2 of 3 emitting scopes carry NO schema_url.
+
+  A schema file can express rename_metrics / rename_attributes / split, and a
+  consumer can only apply one if the data says which schema version it was
+  produced against. gRPC's own OTel plugin emits none. And per the OTel
+  telemetry-stability spec there is currently "a moratorium on relying on
+  schema transformations for telemetry stability" -- so the one mechanism
+  designed to let a convention change safely is both unset in practice and
+  suspended in principle.
+
+==============================================================================
+D4. The rename drill -- what a dashboard sees
+==============================================================================
+
+  A Development convention is permitted to rename. Today the client-side
+  series is named for CHUNKS and the server-side series for TOKENS:
+      client : gen_ai.client.operation.time_to_first_chunk
+      server : gen_ai.server.time_to_first_token
+  (NB: I could find no PR evidence that the client name was ever 'token' --
+   presented here as a RENAME DRILL, not as rename history.)
+
+  A PromQL/OTel dashboard panel is a string:
+      histogram_quantile(0.5, rate({__name__="gen_ai.client.operation.time_to_first_token_bucket"}[5m]))
+
+  After a rename, with no schema_url on the data:
+    series matching the panel's name : 0
+    series actually being produced   : 3 (under gen_ai.client.operation.time_to_first_chunk)
+    result rendered                  : "No data"
+    alert on that panel               : does not fire; it also does not error
+
+  This is the same failure mode as an earlier lab's silent propagation break and an earlier lab's
+  dropped_events_count: the system is not broken, it is empty, and empty looks
+  like healthy.

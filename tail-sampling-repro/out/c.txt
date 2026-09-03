@@ -1,0 +1,52 @@
+  (default ExemplarFilter is TraceBased -- OTEL_METRICS_EXEMPLAR_FILTER default is trace_based (unset))
+
+==============================================================================
+C1. EXEMPLAR POINTER RESOLUTION, ACROSS THE PIPELINE
+==============================================================================
+  gap histogram on A66's 41 latency boundaries; tail sampler with a
+  latency policy at 1000 ms and decision_wait 2.0s.
+  'resolved' = the trace id names a trace the tail sampler KEPT.
+
+  configuration                                exemp  no-tid  unres  partial  complete   resolved
+  ------------------------------------------------------------------------------------------------
+  short stream 1.3s, always_on, no eviction       13       0       0        0        13   100.0%
+  long stream 6.4s, always_on, Scenario 1         33       0      33        0         0     0.0%
+  long stream 6.4s, always_on, Scenario 2         30       0       0       30         0   100.0%
+  long stream 6.4s, always_on, Sc.2 + caches      37       0      37        0         0     0.0%
+  long stream 6.4s, DEFAULT filter, head 1%        0       0       0        0         0     0.0%
+
+  Row 1 is the control: a stream shorter than decision_wait resolves.
+  Row 2 is the same instrumentation on a longer generation.
+  Row 5 is the configuration almost everyone is running today.
+
+==============================================================================
+C2. THE EXEMPLARS THAT MATTER -- gaps over 100 ms
+==============================================================================
+  One call per arm carries an injected 400 ms stall. These are the
+  exemplars the whole mechanism exists to preserve.
+
+  configuration                          tail exemplars   resolving to a kept trace
+  --------------------------------------------------------------------------------
+  short 1.3s, no eviction                       1             1       (worst gap seen: 414 ms)
+  long 6.4s, Scenario 1                         1             0       (worst gap seen: 414 ms)
+  long 6.4s, Scenario 2                         1             1       (worst gap seen: 414 ms)
+  long 6.4s, Sc.2 + caches                      1             0       (worst gap seen: 414 ms)
+  long 6.4s, default filter + head 1%           0             0       (worst gap seen: 0 ms)
+
+  The histogram itself recorded every one of those gaps, in every row.
+  What is lost is not the measurement. It is the ability to ask WHY.
+
+==============================================================================
+C3. THE POINTER IS EXPORTED BEFORE THE TRACE EXISTS
+==============================================================================
+  For the long Scenario-2 arm: exemplar export time vs the moment the
+  trace it names became available downstream (its last kept fragment).
+
+    exemplar value    exported BEFORE the call even ended by
+    ----------------------------------------------------------
+         414.0 ms        2991.2 ms
+
+    plus decision_wait (2s) before the fragment is
+    exported, plus a second decision_wait for the late fragment.
+    At the Collector's 30 s default that is a minute of dangling
+    pointer per exemplar, on top of the generation's own length.

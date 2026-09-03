@@ -1,0 +1,350 @@
+
+==============================================================================
+A0. Are the three personas' metric names even legal in one system?
+==============================================================================
+
+  owner                          metric name                                     legal?
+  --------------------------------------------------------------------------------------
+  MODEL  (vLLM, shipped)         vllm:time_to_first_token_seconds               ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:time_per_output_token_seconds             ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_queue_time_seconds                ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_prefill_time_seconds              ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:request_decode_time_seconds               ILLEGAL
+  MODEL  (vLLM, shipped)         vllm:kv_cache_usage_perc                       ILLEGAL
+  MODEL  (SGLang, shipped)       sglang:time_to_first_token_seconds             ILLEGAL
+  MODEL  (OTel GenAI semconv)    gen_ai.server.time_to_first_token                   OK
+  MODEL  (OTel GenAI semconv)    gen_ai.server.time_per_output_token                 OK
+  CLIENT (OTel GenAI semconv)    gen_ai.client.operation.time_to_first_chunk         OK
+  TRANSPORT (gRFC A66)           grpc.client.attempt.duration                        OK
+  TRANSPORT (gRFC A66)           grpc.server.call.duration                           OK
+  TRANSPORT (gRFC A80)           grpc.tcp.sender_latency                             OK
+  TRANSPORT (proposed)           grpc.client.attempt.time_to_first_message           OK
+  --------------------------------------------------------------------------------------
+  7 of 14 names cannot be registered as an OTel instrument.
+  Every one of them is a MODEL-SERVER name, and the reason is one character:
+  ':' is Prometheus namespacing and is not in the OTel instrument charset.
+
+  opentelemetry-sdk raised: Exception: Expected ASCII string of maximum length 63 characters but got vllm:time_to_first_token_seconds
+  NB the message says 'maximum length 63 characters'. The name is 32
+  characters long. The installed regex is r"[a-zA-Z][-_./a-zA-Z0-9]{0,254}"
+  -- correct per spec (255), but the diagnostic points at the wrong thing.
+
+==============================================================================
+A1. Three real observers, same 8 RPCs (4 prefill-heavy, 4 decode-heavy)
+==============================================================================
+  8 RPCs complete.
+
+  MODEL observer  (GenAI semconv server + vLLM): 6 instrument(s)
+    gen_ai.server.request.duration                       attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    gen_ai.server.time_per_output_token                  attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    gen_ai.server.time_to_first_token                    attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_decode_time_seconds                     attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_prefill_time_seconds                    attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+    vllm.request_queue_time_seconds                      attrs=['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+
+  TRANSPORT observer (gRPC's OWN A66 plugin): 8 instrument(s)
+    grpc.client.attempt.duration                         attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.rcvd_total_compressed_message_size attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.sent_total_compressed_message_size attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.started                          attrs=['grpc.method', 'grpc.target']
+    grpc.server.call.duration                            attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.rcvd_total_compressed_message_size  attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.sent_total_compressed_message_size  attrs=['grpc.method', 'grpc.status']
+    grpc.server.call.started                             attrs=['grpc.method']
+
+  CLIENT observer (the two PROPOSED histograms): 2 instrument(s)
+    grpc.client.attempt.inter_message_gap                attrs=['grpc.method', 'grpc.status', 'grpc.target']
+    grpc.client.attempt.time_to_first_message            attrs=['grpc.method', 'grpc.status', 'grpc.target']
+
+==============================================================================
+A2. Phase x persona matrix, scored from the instruments above
+==============================================================================
+
+  phase                      ML ENG  SRE today  SRE w/ ask   PRODUCT
+  ------------------------------------------------------------------
+  1 admit / tokenize           FULL       NONE        NONE      NONE
+  2 queue                      FULL       NONE        NONE      NONE
+  3 prefill                    FULL       NONE        NONE      NONE
+  4 KV handoff (disagg)        NONE       NONE        PART      NONE
+  5 first token                FULL       NONE        FULL      NONE
+  6 inter-token gaps           FULL       NONE        FULL      NONE
+  7 detokenize + chunk         NONE       NONE        PART      NONE
+  8 wire / transport           NONE       PART        PART      NONE
+  9 whole call                 FULL       FULL        FULL      FULL
+  ------------------------------------------------------------------
+  FULL rows:  ML 6/9   SRE today 1/9   SRE with ask 3/9   PM 1/9
+  ML n SRE shared rows -- today: 1   with the ask: 3
+
+==============================================================================
+A3. THE JOIN QUESTION -- can these go on one dashboard panel?
+==============================================================================
+
+  MODEL     attribute keys (3): ['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
+  TRANSPORT attribute keys (3): ['grpc.method', 'grpc.status', 'grpc.target']
+  CLIENT    attribute keys (3): ['grpc.method', 'grpc.status', 'grpc.target']
+  MODEL n TRANSPORT = EMPTY SET
+  MODEL n CLIENT = EMPTY SET
+  TRANSPORT n CLIENT = ['grpc.method', 'grpc.status', 'grpc.target']
+
+  -> No attribute in common between the model server's metrics and the
+     transport's. Not different names for the same dimension -- no shared
+     dimension at all. Nothing to group_by jointly, nothing to filter both
+     by. The handoff has no join key, so it happens in a meeting.
+
+==============================================================================
+B1. Three honest numbers for 'TTFT' on ONE request
+==============================================================================
+
+  ML engineer  gen_ai.server.time_to_first_token      15.33 ms
+  SRE          time to first MESSAGE (transport)      34.87 ms
+  Product      end to end, user-perceived           1112.47 ms
+
+  offset model->transport: 19.54 ms = 127.5% of the model's number
+  All three are correct. Nothing in any specification says which one an
+  SLO is written against, and no two of them can be joined (see A3).
+
+==============================================================================
+B2. Five real faults x four dashboards -- who sees it?
+==============================================================================
+
+  NB: ml.tpot_p50 is the p50 across requests of each request's MEAN
+      inter-token gap -- the way vLLM defines TPOT. The p50 of each
+      request's MEDIAN gap is tracked alongside it to show the difference.
+
+  baseline: ml.ttft 15.3  ml.tpot 1.745  sre.dur 1106.9  ask.ttfm 34.3  ask.gap_p99 27.75  ask.gap_worst 27.8
+
+  fault                            ML ENGINEER   SRE (today)  SRE (w/ ask)       PRODUCT
+  ------------------------------------------------------------------------------------
+  prefill regression (+40%)               SEES            --          SEES            --
+  queue saturation (+250ms)               SEES          SEES          SEES          SEES
+  slow consumer (20ms/msg)                SEES          SEES          SEES          SEES
+  KV handoff +150ms (disagg)                --            --          SEES            --
+  one 400ms decode stall                  SEES          SEES          SEES          SEES
+  ------------------------------------------------------------------------------------
+  ML ENGINEER    detects 4/5 faults
+  SRE (today)    detects 3/5 faults
+  SRE (w/ ask)   detects 5/5 faults
+  PRODUCT        detects 3/5 faults
+
+==============================================================================
+B2b. What kind of conversation does each fault produce?
+==============================================================================
+
+  prefill regression (+40%)
+      today:        ONLY ML sees it -> HANDOFF
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.prefill_p50           12.81 ->     17.92 ms     +40.0%
+          -   SRE (today)    sre.call_dur_p99       1119.03 ->   1129.72 ms      +1.0%
+        MOVED SRE (w/ ask)   ask.ttfm_p50             34.34 ->     43.98 ms     +28.0%
+          -   PRODUCT        pm.e2e_p50             1106.91 ->   1104.17 ms      -0.2%
+
+  queue saturation (+250ms)
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.queue_p50              0.00 ->    250.00 ms  +7062176.8%
+        MOVED SRE (today)    sre.call_dur_p50       1106.91 ->   1347.47 ms     +21.7%
+        MOVED SRE (w/ ask)   ask.ttfm_p50             34.34 ->    289.11 ms    +741.8%
+        MOVED PRODUCT        pm.e2e_p50             1106.91 ->   1347.47 ms     +21.7%
+
+  slow consumer (20ms/msg)
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.tpot_p50               1.75 ->      3.40 ms     +94.8%
+        MOVED SRE (today)    sre.call_dur_p99       1119.03 ->   2220.88 ms     +98.5%
+        MOVED SRE (w/ ask)   ask.gap_p99              27.75 ->     42.99 ms     +54.9%
+        MOVED PRODUCT        pm.e2e_p50             1106.91 ->   2194.59 ms     +98.3%
+
+  KV handoff +150ms (disagg)
+      today:        NEITHER sees it -> INVISIBLE
+      with the ask: ONLY SRE -> handoff
+          -   ML ENGINEER    ml.ttft_p50              15.33 ->     15.31 ms      -0.2%
+          -   SRE (today)    sre.call_dur_p99       1119.03 ->   1331.73 ms     +19.0%
+        MOVED SRE (w/ ask)   ask.gap_worst            27.76 ->    165.66 ms    +496.8%
+          -   PRODUCT        pm.e2e_p50             1106.91 ->   1250.72 ms     +13.0%
+
+  one 400ms decode stall
+      today:        BOTH see it -> arbitrable
+      with the ask: BOTH -> arbitrable
+        MOVED ML ENGINEER    ml.tpot_p50               1.75 ->      2.39 ms     +36.9%
+        MOVED SRE (today)    sre.call_dur_p99       1119.03 ->   1558.54 ms     +39.3%
+        MOVED SRE (w/ ask)   ask.gap_worst            27.76 ->    408.84 ms   +1372.8%
+        MOVED PRODUCT        pm.e2e_p50             1106.91 ->   1506.47 ms     +36.1%
+
+==============================================================================
+B2c. The SAME fault on the OTHER workload -- who sees it now?
+==============================================================================
+
+  prefill regression (+40%), prefill-heavy workload (4000-token prompt):
+    ml.prefill_p50          800.00 ->   1120.00 ms    +40.0%
+    ml.ttft_p50             802.51 ->   1122.51 ms    +39.9%
+    sre.call_dur_p50       1023.87 ->   1344.14 ms    +31.3%
+    ask.ttfm_p50            820.74 ->   1145.92 ms    +39.6%
+    pm.e2e_p50             1023.87 ->   1344.14 ms    +31.3%
+
+  Same fault, same code, same 40%. On decode-heavy it was 5 ms and only
+  the ML engineer's dashboard moved (because their denominator is 13 ms).
+  On prefill-heavy every dashboard moves. WHO SEES A FAULT IS A PROPERTY
+  OF THE WORKLOAD MIX, not of the instrumentation -- which is why a
+  percentage-based SLO means something different to each persona.
+
+==============================================================================
+B3. Score
+==============================================================================
+  ML vs SRE (today) :  both 3   exactly one 1   neither 1
+  ML vs SRE (w/ ask):  both 4   exactly one 1   neither 0
+
+  'Exactly one' is the count of incidents that must be resolved by a human
+  walking to another team, because the two dashboards cannot be joined.
+
+==============================================================================
+C1-C4. Contract assertions against the REAL libraries
+==============================================================================
+
+  grpc.server.call.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['grpc.method', 'grpc.status']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  grpc.client.attempt.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['grpc.method', 'grpc.status', 'grpc.target']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  grpc.client.call.duration   (emitted_by: grpc-observability)
+    C1 emitted at runtime                     [FAIL]   <- never appears in the export
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+
+  gen_ai.server.time_to_first_token   (emitted_by: model-server)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['gen_ai.operation.name', 'gen_ai.provider.name']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+    C4 SDK helper carries bucket advice       [FAIL]
+       helper source:
+         name=GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+         description="Time to generate first token for successful responses.",
+         unit="s",
+         )
+       -> exported with 15 bucket boundaries (SDK default is 15)
+
+  gen_ai.server.time_per_output_token   (emitted_by: model-server)
+    C1 emitted at runtime                     [PASS]
+    C2 required attributes present            [PASS]   ['gen_ai.operation.name', 'gen_ai.provider.name']
+    C3 convention stability                   [FAIL]   needs 'stable', semconv ships 'development'
+    C4 SDK helper carries bucket advice       [FAIL]
+       helper source:
+         name=GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN,
+         description="Time per output token generated after the first token for successful responses.",
+         unit="s",
+         )
+       -> exported with 15 bucket boundaries (SDK default is 15)
+
+==============================================================================
+C5. Is the join the SLO assumes actually possible?
+==============================================================================
+
+  join 'model-side to transport-side'                          [FAIL]
+    gen_ai.server.time_to_first_token      ['gen_ai.operation.name', 'gen_ai.provider.name']
+    grpc.server.call.duration              ['grpc.method', 'grpc.status']
+    shared dimensions: NONE
+
+==============================================================================
+CONTRACT RESULT
+==============================================================================
+  8/17 assertions pass, 9 FAIL.
+  Every failure is a real property of released software, not of this rig.
+  A dashboard is a consumer of a telemetry API. Nobody writes down the
+  contract, so nobody notices when it is not met.
+
+==============================================================================
+D1. Stability census of the installed semantic-convention package
+==============================================================================
+
+  opentelemetry-semantic-conventions 0.65b0
+
+  METRICS  (a family may have BOTH a stable and an incubating module)
+    families with ANY stable module   ( 2): ['db_metrics', 'http_metrics']
+    families with an incubating module(21)
+    families that exist ONLY as Development (19):
+      azure_metrics, cicd_metrics, container_metrics, cpu_metrics, cpython_metrics, dns_metrics, faas_metrics, gen_ai_metrics, hw_metrics, k8s_metrics, mcp_metrics, messaging_metrics, nfs_metrics, openshift_metrics, otel_metrics, process_metrics, rpc_metrics, system_metrics, vcs_metrics
+    -> gen_ai.*   is DEVELOPMENT
+    -> rpc.*      is DEVELOPMENT
+
+  ATTRIBUTES  (a family may have BOTH a stable and an incubating module)
+    families with ANY stable module   (16): ['client_attributes', 'code_attributes', 'container_attributes', 'db_attributes', 'deployment_attributes', 'error_attributes', 'exception_attributes', 'http_attributes', 'k8s_attributes', 'network_attributes', 'otel_attributes', 'server_attributes', 'service_attributes', 'telemetry_attributes', 'url_attributes', 'user_agent_attributes']
+    families with an incubating module(81)
+    families that exist ONLY as Development (65):
+      app_attributes, artifact_attributes, aws_attributes, az_attributes, azure_attributes, browser_attributes, cassandra_attributes, cicd_attributes, cloud_attributes, cloudevents_attributes, cloudfoundry_attributes, cpu_attributes, cpython_attributes, destination_attributes, device_attributes, disk_attributes, dns_attributes, elasticsearch_attributes, enduser_attributes, event_attributes, faas_attributes, feature_flag_attributes, file_attributes, gcp_attributes, gen_ai_attributes, geo_attributes, graphql_attributes, heroku_attributes, host_attributes, hw_attributes, jsonrpc_attributes, linux_attributes, log_attributes, mainframe_attributes, mcp_attributes, message_attributes, messaging_attributes, net_attributes, nfs_attributes, oci_attributes, onc_rpc_attributes, openai_attributes, openshift_attributes, opentracing_attributes, oracle_attributes, oracle_cloud_attributes, os_attributes, other_attributes, peer_attributes, pool_attributes, pprof_attributes, process_attributes, profile_attributes, rpc_attributes, security_rule_attributes, session_attributes, source_attributes, system_attributes, test_attributes, thread_attributes, tls_attributes, user_attributes, vcs_attributes, webengine_attributes, zos_attributes
+    -> gen_ai.*   is DEVELOPMENT
+    -> rpc.*      is DEVELOPMENT
+
+  Both personas' latency conventions ship in _incubating. The OTel
+  versioning spec on Development signals: "Long-term dependencies
+  SHOULD NOT be taken against signals in Development." An SLO is a
+  long-term dependency. Everyone has one anyway.
+
+==============================================================================
+D2. Two authorities, two answers, for the SAME metric name
+==============================================================================
+
+  grpc.server.call.duration
+    gRFC A66            : defined here, and A66 states it OVERRIDES OTel's
+                          general RPC conventions for gRPC
+    grpc.io docs        : listed under "Server (stable, on by default)"
+    OTel semconv package: ships rpc_metrics under _incubating/  -> DEVELOPMENT
+    OTLP on the wire    : carries no stability field at all (see D3)
+
+  gen_ai.server.time_to_first_token
+    semconv-genai docs  : Development
+    OTel semconv package: _incubating/  -> DEVELOPMENT
+    consistent -- and consistently unusable as an SLO by the spec's own rule.
+
+  A consumer holding a dashboard has no programmatic way to ask "may I depend
+  on this name?" The answer lives in three documents and none of them travels
+  with the data.
+
+==============================================================================
+D3. schema_url -- the migration mechanism's precondition
+==============================================================================
+
+  The package knows about 21 schema versions; newest:
+    https://opentelemetry.io/schemas/1.43.0
+
+  scope                      schema_url                                     metrics
+  ----------------------------------------------------------------------------------
+  grpc-python                (none)                                         8
+  app-no-schema              (none)                                         1
+  app-with-schema            https://opentelemetry.io/schemas/1.43.0        1
+  ----------------------------------------------------------------------------------
+  2 of 3 emitting scopes carry NO schema_url.
+
+  A schema file can express rename_metrics / rename_attributes / split, and a
+  consumer can only apply one if the data says which schema version it was
+  produced against. gRPC's own OTel plugin emits none. And per the OTel
+  telemetry-stability spec there is currently "a moratorium on relying on
+  schema transformations for telemetry stability" -- so the one mechanism
+  designed to let a convention change safely is both unset in practice and
+  suspended in principle.
+
+==============================================================================
+D4. The rename drill -- what a dashboard sees
+==============================================================================
+
+  A Development convention is permitted to rename. Today the client-side
+  series is named for CHUNKS and the server-side series for TOKENS:
+      client : gen_ai.client.operation.time_to_first_chunk
+      server : gen_ai.server.time_to_first_token
+  (NB: I could find no PR evidence that the client name was ever 'token' --
+   presented here as a RENAME DRILL, not as rename history.)
+
+  A PromQL/OTel dashboard panel is a string:
+      histogram_quantile(0.5, rate({__name__="gen_ai.client.operation.time_to_first_token_bucket"}[5m]))
+
+  After a rename, with no schema_url on the data:
+    series matching the panel's name : 0
+    series actually being produced   : 3 (under gen_ai.client.operation.time_to_first_chunk)
+    result rendered                  : "No data"
+    alert on that panel               : does not fire; it also does not error
+
+  This is the same failure mode as an earlier lab's silent propagation break and an earlier lab's
+  dropped_events_count: the system is not broken, it is empty, and empty looks
+  like healthy.
